@@ -44,41 +44,127 @@ Backup your stock boot.img first (`fastboot fetch boot` or from the factory imag
   (depends on !ARM64), SECURITY_PERF_EVENTS_RESTRICT (no such symbol),
   KPTI/SSBD/errata mitigations (stock ships them off).
 
-## PSTORE policy: permanently OFF (correcting an earlier claim)
+## PSTORE / ramoops — enabled in v18 after fixing the DTB reservation
 
-Stock's exposed config shows `PSTORE*/PSTORE_RAM=y`, but that line comes from
-Xiaomi's fake static `config_data.gz` — the *running* stock kernel has no
-pstore either (`/proc/filesystems` lacks pstore, `/sys/fs/pstore` empty).
-Enabling `CONFIG_PSTORE_RAM` on crux is proven to bootloop (v3 / Run #31,
-see Bootloop lessons) because the merged crux DTB carries no usable ramoops
-reservation (the base sm8150.dtsi `ramoops@a1600000` region collides with the
-`sdx50m` overlay's `pil_buffer_p1_region@a1000000+2C00000`). Do NOT add
-PSTORE back "for parity" — parity is already achieved by matching stock's
-*actual runtime behavior*. Crash forensics on this platform relies on
-QSEE minidumps, not Linux-side ramoops.
+History: enabling `CONFIG_PSTORE_RAM` in v3 (Run #31) **bootlooped** crux, so the
+feature was banned and the README claimed crash forensics was impossible here.
+That diagnosis was incomplete — the config was never the problem, the reserved
+memory layout was.
 
-## The boot dialog ("device internal problem") — status: RESOLVED via stock-parity config
+### Actual root cause (addresses verified in-tree)
+
+```
+sm8150.dtsi        ramoops@a1600000   size 0x800000  → 0xa1600000..0xa1e00000
+sm8150-sdx50m.dtsi pil_buffer_p1      size 0x02c00000 → 0xa1000000..0xa3c00000
+                                                         ^^^^^^^^^^^^^^^^^^^^
+                                                      ramoops sits entirely
+                                                      inside the PIL buffer
+```
+
+The crux overlay (`crux-sm8150-overlay.dts`) includes `sm8150-sdx50m.dtsi`, so
+both nodes land in the same tree. The kernel rejects the overlap
+(`OF: reserved mem: OVERLAP DETECTED!`), ramoops never registers, and every
+`msm_watchdog: Dump setup failed` follows. Enabling PSTORE on top of that is
+what hung early boot — pstore had no backing region.
+
+### Fix
+
+`crux-sm8150-overlay.dts` now redefines the node further up the memory map:
+
+```
+ramoops@a8800000  size 0x400000   (record/console/pmsg/ftrace 1 MiB each)
+```
+
+`0xa8800000` is the first address after the last reserved pool in this map
+(`removed-dma-pool` ends exactly there). Region map for reference:
+
+| Region | Range |
+|---|---|
+| `cont_splash_memory` | `0x9c000000`–`0x9e400000` |
+| `pil_buffer_p2` | `0xa0000000`–`0xa1000000` |
+| `pil_buffer_p1` | `0xa1000000`–`0xa3c00000` |
+| `mhi_mem` | `0xa3c00000`–`0xa4c00000` |
+| `removed-dma-pool` | `0xa4c00000`–`0xa8800000` |
+| **`ramoops` (new)** | **`0xa8800000`–`0xa8c00000`** |
+
+### Verify after flashing
+
+```sh
+ls /sys/fs/pstore/                              # must exist
+grep pstore /proc/filesystems                   # nodev pstore
+dmesg | grep -i ramoops                         # no OVERLAP DETECTED
+dmesg | grep -i "watchdog.*dump"                # should no longer say "setup failed"
+```
+
+If the device does **not** boot, the RAM hole is the suspect (bootloader or
+hypervisor may not leave `0xa8800000` free). Revert the five `CONFIG_PSTORE*`
+lines in `.ci/droidspaces.config` first — the DTB node alone is harmless.
+
+## The boot dialog ("device internal problem") — RESOLVED in v17
 
 Root cause: framework-side VINTF kernel compatibility check
 (ActivityManagerService.systemReady → `Build.isBuildConsistent()` → libvintf vs
-the FCM matrix embedded in the ROM). It is NON-FATAL, shows once per boot.
+the FCM matrices in `/system/etc/vintf/compatibility_matrix.*.xml`). The dialog
+is non-fatal (shows once per boot) but indicates a real config mismatch.
 
-Two classes of violations existed and were fixed differently:
+### The rule that matters: ABSENT ≠ "is not set"
 
-| Symbol | Matrix requires | Stock had | Fix |
+libvintf reads `/proc/config.gz` and behaves differently for the two cases:
+
+| What the config says | What libvintf does |
+|---|---|
+| the symbol is **not present at all** | skips it — no check |
+| `# CONFIG_X is not set` or `CONFIG_X=n` | parses value `n`, **compares** it |
+
+This is the single most important fact about this mechanism. Fabricating
+`# CONFIG_X is not set` lines for symbols the kernel does not have converts a
+skipped check into a failing one.
+
+### How v15/v16 got this wrong (and v13 was right)
+
+v13 shipped with none of these symbols present and showed **no** dialog. In
+v15/v16 an attempt to satisfy the matrices "thoroughly" appended eight fake
+entries, which created new violations:
+
+| Symbol | v13 (no dialog) | v16 (dialog) | Matrix actually wants |
 |---|---|---|---|
-| `CONFIG_NETFILTER_XT_MATCH_QUOTA2_LOG` | `y` | `y` | real enable (symbol exists in tree) |
-| `CONFIG_IP6_NF_NAT` | `n` | `y`(!) | IKCONFIG spoof to `n` at packaging time (kernel keeps NAT functionality; only the exposed config lies, matching what the audit reads) |
-| `CONFIG_ANDROID_LOW_MEMORY_KILLER` | present as `y` | `y` | v13: Kconfig stub + `mm/lowmemorykiller_compat.c` (`lmk_kill_possible() -> false`) so it compiles genuinely `=y` |
-| `CONFIG_SECURITY_PERF_EVENTS_RESTRICT` | present as `y` | `y` | v13: Kconfig stub in `security/Kconfig.hardening` (paranoid default already set via cmdline) |
-| `CONFIG_IKHEADERS` | `n` | `y` | kept `y` deliberately (needed for config forensics; does not trigger the dialog) |
+| `CONFIG_PM_AUTOSLEEP` | absent | `=n` | level 1 & 2 want **y** → violated |
+| `CONFIG_DEBUG_RODATA` | absent | `=y` | level 4 wants y — but absent was already fine |
+| `CONFIG_DEBUG_SET_MODULE_RONX` | absent | `=y` | same |
+| `CONFIG_DEVKMEM` / `INET_LRO` / `OABI_COMPAT` | absent | `is not set` | fabricated for no reason |
+| `CONFIG_NETFILTER_XT_MATCH_QTAGUID` | absent | `is not set` | fabricated for no reason |
+| `CONFIG_NETFILTER_XT_MATCH_PHYSDEV` | absent | `is not set` | **not in any matrix at all** |
+| `CONFIG_IP6_NF_NAT` | `y` | spoofed `n` | **not in any matrix at all** |
 
-Earlier iterations also proved: after fixing every fixable violation the dialog
-could persist due to ROM/matrix inconsistencies unrelated to our build; the v13
-stock-parity approach (make the exposed config byte-comparable to stock for the
-audited symbols) is the current resolution path. Remaining structurally-absent
-matrix names (`CONFIG_SYNC`, `CONFIG_ANDROID_PARANOID`, `CONFIG_ARM64_4K_STACKS`
-etc.) are equally absent from stock and are skipped by libvintf the same way.
+`CONFIG_IP6_NF_NAT` and `NETFILTER_XT_MATCH_PHYSDEV` appear in **zero**
+applicable matrix blocks — the v14/v15 spoofing of them solved nothing.
+
+### Final approach: minimal spoof, two symbols only
+
+Exactly two symbols really exist in `.config` and really need a different
+reported value. Everything else is left untouched.
+
+| Symbol | Kernel actually | Reported to VINTF | Why |
+|---|---|---|---|
+| `CONFIG_SYSVIPC` | `y` | `n` | every matrix level demands `n`; Droidspaces needs it really on |
+| `CONFIG_USB_RTL8152` | `y` | `# ... is not set` | `compatibility_matrix.4.xml` demands `n` |
+
+Both are rewritten in `config_data` before gzip — the kernel keeps the code,
+only the *reported* config lies. The sed chain lives in `.ci/build-kernel.sh`
+(PYMK block) and CI asserts the result plus the absence of every symbol that
+must not be fabricated.
+
+Result (Run #55 / v17): **no dialog, Docker networking works.** IKCFG is 6,301
+lines, identical to v13 apart from those two entries.
+
+### Don't trust the "stock" config blob
+
+The IKCFG inside a stock crux `boot.img` is **not** a reliable benchmark: it is
+Xiaomi's static `config_data.gz`, and the copy inspected during this
+investigation contained `lz4k_oplus`, `VSERVICES_*` and `CONFIG_XIAOMI_SOLUTION`
+together — impossible for a single real device kernel. Reasoning "stock is
+absent there, so it's safe" against that file is unsound; v13's observed
+behaviour is the better reference.
 
 ## CI note: kernel/Makefile IKCONFIG patch
 
@@ -88,8 +174,8 @@ rules that re-point `$(obj)/config_data.gz` at static files under
 This makes the embedded `IKCONFIG` blob (and `/proc/config.gz`) always show the
 stock config, regardless of what was actually compiled in. `.ci/build-kernel.sh`
 (PYMK block) removes those rules at build time and restores the standard upstream
-dependency chain: real `.config` → `config_data` (single sed: `IP6_NF_NAT=y→n`) →
-`config_data.gz` → `configs.o`.
+dependency chain: real `.config` → `config_data` (two-symbol sed, see the dialog
+section above) → `config_data.gz` → `configs.o`.
 
 **Idempotency is enforced**: the PYMK block deletes any previously injected
 `# --- droidspaces:` rule block (scanning forward to its `$(call if_changed,gzip)`
@@ -100,7 +186,9 @@ to 18,852 lines — do not reintroduce append-style injection.
 
 Post-build the CI extracts the IKCFG blob from `Image.gz-dtb` and asserts:
 MACVLAN/MASQUERADE/AUDIT =y, QUOTA2_LOG =y, LOW_MEMORY_KILLER =y,
-PERF_EVENTS_RESTRICT =y, IP6_NF_NAT spoofed to `n`, FHANDLE absent. Any mismatch
+PERF_EVENTS_RESTRICT =y, SYSVIPC reported `n` while really `y`, RTL8152 reported
+`# ... is not set`, IP6_NF_NAT left untouched at `y`, FHANDLE absent, and the
+six symbols that must never be fabricated are asserted ABSENT. Any mismatch
 fails the run.
 
 ## Repacking onto a signed/footered boot partition (offline recipe)
@@ -125,19 +213,28 @@ bytes identical to stock.
 
 ## Bootloop lessons (hard rules for this tree)
 
-Two config changes were proven to bootloop on real crux hardware and are permanently banned:
+One config change was proven to bootloop on real crux hardware and stays banned;
+a second one turned out to be a DTB problem rather than a config problem:
 
-1. **CONFIG_PSTORE / PSTORE_RAM** (v3, Run #31): crux's merged DTB has no usable ramoops
-   node; enabling pstore console backend hangs early boot. Never enable without adding a
-   ramoops node in dts + memmap reservation.
+1. ~~**CONFIG_PSTORE / PSTORE_RAM** (v3, Run #31)~~ — **RESOLVED in v18.** The
+   bootloop was caused by ramoops colliding with `pil_buffer_p1_region`, not by
+   pstore itself. With the node moved to `0xa8800000` the feature is enabled
+   again. See the PSTORE section above.
 2. **CONFIG_SECURITY_YAMA=y** (v6/v7, Runs #35/#36): YAMA LSM registration breaks vendor
    sepolicy assumptions at boot (stock ships it "not set"). Binary-search evidence: v7
    restored SYSFS_SYSCALL=y but kept YAMA=y and still bootlooped; SYSFS_SYSCALL=n is
-   therefore NOT the culprit (v8 with SYSFS_SYSCALL=y boots fine).
+   therefore NOT the culprit (v8 with SYSFS_SYSCALL=y boots fine). **Still banned.**
 
-General rule derived: only ADD pure networking/module symbols that have no stock conflict.
-Never flip stock-y syscall-table/security/pstore symbols. FHANDLE=off is the single
-exception, forced by FCM3 VINTF, verified safe on v4+.
+General rules derived:
+
+- Only ADD pure networking/module symbols that have no stock conflict.
+- Never flip stock-y syscall-table/security symbols. FHANDLE=off is the single
+  exception, forced by FCM3 VINTF, verified safe on v4+.
+- **When a feature bootloops, check the DTS reservation before blaming the
+  config.** PSTORE was banned for nine versions over a memory overlap that a
+  5-line overlay patch fixed.
+- **Never fabricate config entries for VINTF.** A symbol absent from the tree
+  must stay absent — see the dialog section. This one cost v14 through v16.
 
 ## Repository layout
 
@@ -156,6 +253,18 @@ KernelSU (in-tree)     # CONFIG_KSU=y
 
 ## Release state
 
-Current head: **v13** (Run #46, commit `a3cdc404df23`).
-Artifact: `crux-droidspaces-boot.zip` → `out/boot.img` (21,663,744 B) + `Image.gz-dtb`.
-IKCFG: 6,286 lines, 0 duplicate symbols, all audited values stock-aligned.
+**v17 — verified on device**: no "device internal problem" dialog, Docker
+networking fully functional. Run #55, commit `c39571c36e11`.
+IKCFG: 6,301 lines, two spoofed entries (`SYSVIPC`, `USB_RTL8152`), everything
+else untouched.
+
+**v18 — pending device verification**: adds pstore/ramoops crash forensics by
+relocating the ramoops reservation out of the PIL buffer window. If it does not
+boot, revert the five `CONFIG_PSTORE*` lines in `.ci/droidspaces.config`; nothing
+else in v18 changes behaviour.
+
+Two-symbol spoof reminder for future work: the *only* symbols whose reported
+value may differ from the compiled value are `CONFIG_SYSVIPC` and
+`CONFIG_USB_RTL8152`. Adding a third requires showing it exists in `.config`
+**and** appears in an applicable `compatibility_matrix.*.xml` block with a
+conflicting value. `CONFIG_IP6_NF_NAT` satisfies neither condition.

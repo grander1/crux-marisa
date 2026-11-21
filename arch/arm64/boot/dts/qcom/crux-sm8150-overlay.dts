@@ -29,5 +29,34 @@
 	compatible = "qcom,sm8150-mtp", "qcom,sm8150", "qcom,mtp";
 	qcom,board-id = <0x2B 0x1>;
 
+	/*
+	 * ramoops relocation for crux.
+	 *
+	 * sm8150.dtsi places ramoops at 0xa1600000 (8 MiB). The sdx50m overlay
+	 * pulled in above reserves pil_buffer_p1_region at 0xa1000000 for
+	 * 0x02c00000 bytes, i.e. 0xa1000000..0xa3c00000 - which fully swallows
+	 * 0xa1600000..0xa1e00000. Result: "OF: reserved mem: OVERLAP DETECTED"
+	 * and pstore never registers.
+	 *
+	 * Move it to 0xa8800000, the first address after the last reserved pool
+	 * in this memory map (removed-dma-pool ends at 0xa8800000). Nothing else
+	 * is placed there by sm8150.dtsi or sm8150-sdx50m.dtsi.
+	 *
+	 * NOTE: bootloader/hypervisor also has to leave this hole alone. If the
+	 * device bootloops after enabling PSTORE, this address is the suspect --
+	 * see the PSTORE section in README.md.
+	 */
+	reserved-memory {
+		ramoops: ramoops@a8800000 {
+			compatible = "ramoops";
+			reg = <0x0 0xa8800000 0x0 0x400000>;
+			record-size = <0x100000>;
+			console-size = <0x100000>;
+			pmsg-size = <0x100000>;
+			ftrace-size = <0x100000>;
+			ecc-size = <16>;
+			max-reason = <4>;
+		};
+	};
 };
 

@@ -332,6 +332,14 @@ for k in ['CONFIG_ANDROID_LOW_MEMORY_KILLER','CONFIG_SECURITY_PERF_EVENTS_RESTRI
         print('IKCFG BAD: %s must be =y, got' % k, hit); ok=False
     else:
         print('IKCFG OK: %s=y' % k)
+
+# pstore/ramoops must be compiled in (v18) - the DTB now provides a valid region
+for k in ['CONFIG_PSTORE','CONFIG_PSTORE_RAM','CONFIG_PSTORE_CONSOLE','CONFIG_PSTORE_PMSG']:
+    hit=[l for l in cfg.splitlines() if l.startswith(k+'=')]
+    if hit != [k+'=y']:
+        print('IKCFG BAD: %s must be =y, got' % k, hit); ok=False
+    else:
+        print('IKCFG OK: %s=y' % k)
 print('IKCFG total lines:', len(cfg.splitlines()))
 sys.exit(0 if ok else 1)
 PYIKCFG
